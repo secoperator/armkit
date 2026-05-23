@@ -67,25 +67,35 @@ echo "[*] Building"
 ninja -v
 
 echo ""
-echo "[+] Built: $BUILD_DIR/armkit"
+echo "[+] Built artifacts in $BUILD_DIR :"
+echo "       armkit              — standalone PIE executable"
+echo "       payload.elf         — relocation-free blob (ELF)"
+echo "       armkit_payload.bin  — flat blob produced by objcopy"
+echo "       loader              — host program: mmap+memcpy+mprotect+jump"
 echo ""
 
-# Print ELF header summary if readelf is available
-for re in aarch64-linux-android-readelf aarch64-linux-gnu-readelf readelf; do
+# Inspect the payload to confirm no runtime relocations remain.
+for re in aarch64-linux-android-readelf aarch64-linux-gnu-readelf llvm-readelf readelf; do
     if command -v "$re" &>/dev/null; then
-        echo "[*] ELF header (via $re):"
-        "$re" -h "$BUILD_DIR/armkit" 2>/dev/null | grep -E 'Type|Entry|Flags|Machine' || true
+        echo "[*] payload.elf sections (via $re):"
+        "$re" -S "$BUILD_DIR/payload.elf" 2>/dev/null \
+            | grep -E '\.text|\.rodata|\.data|\.rela|\.dynamic' || true
         echo ""
-        echo "[*] Program headers:"
-        "$re" -l "$BUILD_DIR/armkit" 2>/dev/null | head -40 || true
-        echo ""
-        echo "[*] Dynamic section (should be empty or absent for static-pie):"
-        "$re" -d "$BUILD_DIR/armkit" 2>/dev/null | head -20 || true
+        echo "[*] payload.elf relocations (should be EMPTY):"
+        "$re" -r "$BUILD_DIR/payload.elf" 2>/dev/null | head -5 || true
         break
     fi
 done
 
-echo "[*] To run on a device:"
-echo "    adb push $BUILD_DIR/armkit /data/local/tmp/armkit"
+ls -la "$BUILD_DIR/armkit_payload.bin" 2>/dev/null || true
+echo ""
+echo "[*] To run the standalone PIE on a device:"
+echo "    adb push $BUILD_DIR/armkit /data/local/tmp/"
 echo "    adb shell chmod +x /data/local/tmp/armkit"
 echo "    adb shell /data/local/tmp/armkit"
+echo ""
+echo "[*] To run the loader+blob on a device:"
+echo "    adb push $BUILD_DIR/loader              /data/local/tmp/"
+echo "    adb push $BUILD_DIR/armkit_payload.bin  /data/local/tmp/"
+echo "    adb shell chmod +x /data/local/tmp/loader"
+echo "    adb shell /data/local/tmp/loader /data/local/tmp/armkit_payload.bin"

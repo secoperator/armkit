@@ -13,18 +13,30 @@ A self-contained, position-independent executable for ARM64 Android that:
 ```
 armkit/
 ├── include/
-│   ├── syscall.hpp    — ARM64 svc #0 wrappers (no libc)
-│   ├── mem_utils.hpp  — memset/memcpy/strcmp/strlen without libc
-│   ├── elf_utils.hpp  — /proc/self/maps parser + ELF symbol lookup
-│   └── fmt.hpp        — printf implementation over sys_write
+│   ├── syscall.hpp     — ARM64 svc #0 wrappers (no libc)
+│   ├── mem_utils.hpp   — memset/memcpy/strcmp/strlen without libc
+│   ├── elf_utils.hpp   — /proc/self/maps parser + ELF symbol lookup
+│   └── fmt.hpp         — printf implementation over sys_write
 ├── src/
-│   ├── entry.S        — raw _start: reads argc/argv/envp from stack
-│   └── main.cpp       — pie_main() demo
+│   ├── entry.S         — raw _start: reads argc/argv/envp from stack
+│   ├── main.cpp        — pie_main() demo for the standalone executable
+│   ├── payload.cpp     — payload_entry() callable from a raw blob
+│   └── loader.c        — mmap+memcpy+mprotect+function-ptr loader
 ├── linker/
-│   └── pie.ld         — linker script (no PT_INTERP, no copy-relocs)
+│   ├── pie.ld          — script for the standalone PIE (no PT_INTERP)
+│   └── payload.ld      — script for the blob (no relocations at all)
 ├── CMakeLists.txt
-└── build.sh           — NDK build convenience script
+└── build.sh            — NDK build convenience script
 ```
+
+## Build outputs
+
+| File | What it is |
+|------|------------|
+| `armkit` | Standalone PIE executable. Runs via `execve`; ships its own `_start`. |
+| `payload.elf` | Same code, linked statically with zero runtime relocations. Not meant to run on its own. |
+| `armkit_payload.bin` | Flat blob: `.text + .rodata + .data` of `payload.elf` concatenated by `objcopy -O binary`. Entry point is at offset 0. |
+| `loader` | Normal Android executable that loads `armkit_payload.bin` into RWX memory and jumps to it. |
 
 ## Building
 
@@ -56,11 +68,79 @@ ninja -C build-arm64
 
 ### Running on a device
 
+Standalone PIE:
+
 ```bash
-adb push build-arm64/armkit /data/local/tmp/armkit
+adb push build-arm64/armkit /data/local/tmp/
 adb shell chmod +x /data/local/tmp/armkit
 adb shell /data/local/tmp/armkit
 ```
+
+Loader + blob:
+
+```bash
+adb push build-arm64/loader              /data/local/tmp/
+adb push build-arm64/armkit_payload.bin  /data/local/tmp/
+adb shell chmod +x /data/local/tmp/loader
+adb shell /data/local/tmp/loader /data/local/tmp/armkit_payload.bin
+```
+
+## The blob + loader pipeline
+
+### Producing `armkit_payload.bin`
+
+`linker/payload.ld` lays out the payload so that:
+
+1. `payload_entry` (tagged with `__attribute__((section(".text.entry")))`)
+   is `KEEP`-ed first inside `.text`, landing at offset `0x0`.
+2. `.rodata` follows immediately, then `.data`.
+3. Everything that would need runtime relocation processing
+   (`.interp`, `.dynamic`, `.got`, `.plt`, `.rela.*`) is `/DISCARD/`-ed.
+   If the linker fails because one of those isn't empty, the source did
+   something that needs a relocation — fix the source.
+
+The CMake build then runs:
+
+```
+objcopy -O binary \
+        --only-section=.text \
+        --only-section=.rodata \
+        --only-section=.data \
+        payload.elf armkit_payload.bin
+```
+
+The resulting `.bin` is a pure image: byte 0 is the first instruction of
+`payload_entry`, byte N is wherever `.data` ended.
+
+### Loading it from `loader.c`
+
+```c
+void* mem = mmap(NULL, pages,
+                 PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+memcpy(mem, blob, blob_size);
+mprotect(mem, pages, PROT_READ | PROT_EXEC);
+__builtin___clear_cache(mem, (char*)mem + pages);
+
+int (*entry)(int, char**) = (int(*)(int,char**))mem;
+int rc = entry(argc, argv);
+```
+
+This is the whole runtime: get RW pages, copy bytes in, flip to RX, flush
+the I-cache (mandatory on ARM after writing code), call offset 0.
+
+### Why this works without relocations
+
+The payload is compiled with `-fPIC -fvisibility=hidden`. On AArch64
+that means every reference inside the blob is materialised by:
+
+* `adrp` + `add` for `.rodata` / `.data` symbols (PC-relative within ±4 GiB)
+* `b` / `bl` for local function calls (PC-relative ±128 MiB)
+
+No `.got`, no absolute-address constants in `.data`, no vtables, no
+exception unwind tables. The static linker resolves every offset at link
+time; nothing remains for a dynamic linker to do, so the blob can be
+relocated to any address by `mmap` and still execute correctly.
 
 ## Architecture
 
